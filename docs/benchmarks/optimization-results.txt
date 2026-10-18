@@ -1,0 +1,104 @@
+Baseline: c5e62796d3a8a063c71e4eb5ada6768eae45e7ae
+Candidate: working tree prepared for the performance PR
+Host: Linux x86_64; AMD Ryzen 5 PRO 3500U; rustc 1.95.0
+Profile: release, default CPU target; no target-cpu=native
+Date: 2026-10-18T22:30:20.170984+00:00
+UDP: 32 packets/window, 3 one-second trials/size/run, baseline/candidate/candidate/baseline
+Packet transform: same ignored benchmark injected into baseline wgobfs.rs; 1,000,000 iterations/size; 3 runs/build
+
+UDP baseline
+size=64 trial=0 sent=23840 received=23840 roundtrips/s=23839 payload_mbit/s=12.21
+size=64 trial=1 sent=24832 received=24832 roundtrips/s=24806 payload_mbit/s=12.70
+size=64 trial=2 sent=25216 received=25216 roundtrips/s=25213 payload_mbit/s=12.91
+size=1400 trial=0 sent=23872 received=23872 roundtrips/s=23860 payload_mbit/s=267.23
+size=1400 trial=1 sent=22784 received=22784 roundtrips/s=22752 payload_mbit/s=254.83
+size=1400 trial=2 sent=24320 received=24320 roundtrips/s=24292 payload_mbit/s=272.07
+
+UDP candidate
+size=64 trial=0 sent=29344 received=29344 roundtrips/s=29339 payload_mbit/s=15.02
+size=64 trial=1 sent=29984 received=29984 roundtrips/s=29979 payload_mbit/s=15.35
+size=64 trial=2 sent=28288 received=28288 roundtrips/s=28279 payload_mbit/s=14.48
+size=1400 trial=0 sent=25728 received=25728 roundtrips/s=25705 payload_mbit/s=287.89
+size=1400 trial=1 sent=27232 received=27232 roundtrips/s=27222 payload_mbit/s=304.88
+size=1400 trial=2 sent=23264 received=23264 roundtrips/s=23223 payload_mbit/s=260.10
+
+UDP candidate
+size=64 trial=0 sent=24992 received=24992 roundtrips/s=24982 payload_mbit/s=12.79
+size=64 trial=1 sent=29600 received=29600 roundtrips/s=29593 payload_mbit/s=15.15
+size=64 trial=2 sent=29664 received=29664 roundtrips/s=29649 payload_mbit/s=15.18
+size=1400 trial=0 sent=29024 received=29024 roundtrips/s=29008 payload_mbit/s=324.89
+size=1400 trial=1 sent=29568 received=29568 roundtrips/s=29560 payload_mbit/s=331.07
+size=1400 trial=2 sent=26976 received=26976 roundtrips/s=26961 payload_mbit/s=301.96
+
+UDP baseline
+size=64 trial=0 sent=24608 received=24608 roundtrips/s=24579 payload_mbit/s=12.58
+size=64 trial=1 sent=25472 received=25472 roundtrips/s=25442 payload_mbit/s=13.03
+size=64 trial=2 sent=26400 received=26400 roundtrips/s=26380 payload_mbit/s=13.51
+size=1400 trial=0 sent=24416 received=24416 roundtrips/s=24386 payload_mbit/s=273.12
+size=1400 trial=1 sent=23488 received=23488 roundtrips/s=23467 payload_mbit/s=262.83
+size=1400 trial=2 sent=25216 received=25216 roundtrips/s=25211 payload_mbit/s=282.36
+
+Transform baseline run=0
+
+running 1 test
+packet_roundtrip size=64: 459.5 ns
+packet_roundtrip size=148: 462.5 ns
+packet_roundtrip size=1400: 680.1 ns
+test wgobfs::performance_comparison::benchmark_packets ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.60s
+
+
+Transform candidate run=0
+
+running 1 test
+packet_roundtrip size=64: 233.5 ns
+packet_roundtrip size=148: 216.3 ns
+packet_roundtrip size=1400: 307.8 ns
+test wgobfs::tests::benchmark_packets ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.76s
+
+
+Transform baseline run=1
+
+running 1 test
+packet_roundtrip size=64: 456.1 ns
+packet_roundtrip size=148: 474.0 ns
+packet_roundtrip size=1400: 639.4 ns
+test wgobfs::performance_comparison::benchmark_packets ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.57s
+
+
+Transform candidate run=1
+
+running 1 test
+packet_roundtrip size=64: 221.1 ns
+packet_roundtrip size=148: 243.1 ns
+packet_roundtrip size=1400: 331.8 ns
+test wgobfs::tests::benchmark_packets ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.80s
+
+
+Transform baseline run=2
+
+running 1 test
+packet_roundtrip size=64: 508.0 ns
+packet_roundtrip size=148: 480.4 ns
+packet_roundtrip size=1400: 617.9 ns
+test wgobfs::performance_comparison::benchmark_packets ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.61s
+
+
+Transform candidate run=2
+
+running 1 test
+packet_roundtrip size=64: 223.4 ns
+packet_roundtrip size=148: 235.0 ns
+packet_roundtrip size=1400: 307.2 ns
+test wgobfs::tests::benchmark_packets ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.77s

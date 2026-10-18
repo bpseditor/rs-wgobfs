@@ -275,7 +275,7 @@ dispatch_light128!(m, Mach, {
 // use a 16-byte nonce to fill counter and stream_id
 dispatch_light128!(m, Mach, {
     fn init_chacha_nonce16(key: &[u8; 32], nonce: &[u8; 16]) -> ChaCha {
-         let ctr_nonce = [
+        let ctr_nonce = [
             read_u32le(&nonce[0..4]),
             read_u32le(&nonce[4..8]),
             read_u32le(&nonce[8..12]),
