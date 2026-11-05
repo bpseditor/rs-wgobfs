@@ -19,20 +19,58 @@ use crate::wgobfs::{obfs_udp_payload, unobfs_udp_payload, ForwardState};
 
 const HELP: &str = "\
 USAGE:
-  rs-wgobfs [OPTIONS]
+  rs-wgobfs -l <IP:Port> -f <IP|Hostname:Port> -k <key> -m <mode> [OPTIONS]
 
 OPTIONS:
-  -h, --help                          Print help information
-  -l or --listen <IP:Port>            Listen address:port
-  -f or --forward <IP|Hostname:Port>  Peer's address:port
-  -6                                  (Optional) Prefer IPv6 when connecting
-                                      to the forward Peer
+  -h, --help                   Print help information
+  -l, --listen <IP:Port>        Local UDP listening address
+  -f, --forward <Host:Port>     Destination for traffic received on --listen
+  -6                           Prefer IPv6 when resolving --forward
+  -k, --key <key>              Shared secret, repeated or truncated to 32 bytes
+  -m, --mode <mode>            Select a mode from the list below
+  --max-datagram <bytes>       Maximum outgoing UDP payload in fragment modes
+                               Default: 1200; allowed: 128..=65507
+                               Includes framing and obfuscation padding;
+                               excludes UDP and IP headers
 
-  -k or --key                         Shared secret (will be repeated or
-                                      truncated to 32 characters)
+MODES:
+  obfs          Client: receive local WireGuard packets and obfuscate them
+                for the remote peer; deobfuscate replies.
+  unobfs        Server: receive obfuscated packets and forward them to local
+                WireGuard; obfuscate replies.
+                These two modes use the legacy xt_wgobfs-compatible format.
 
-  -m or --mode <mode>                 Mode: obfs, unobfs, obfs-frag, unobfs-frag
-  --max-datagram <bytes>              Fragment mode UDP payload limit (default 1200)
+  obfs-frag     Client: split WireGuard packets into bounded, individually
+                obfuscated UDP fragments; reassemble incoming replies.
+  unobfs-frag   Server: reassemble and deobfuscate incoming fragments for
+                local WireGuard; fragment and obfuscate replies.
+                Both ends must run rs-wgobfs with matching fragment modes
+                and the same key. Incompatible with legacy modes and xt_wgobfs.
+
+FRAGMENT TRANSPORT:
+  Use obfs-frag on the client and unobfs-frag on the server. Point the client's
+  WireGuard endpoint at the client's --listen address. The server's --forward
+  address must point to its local WireGuard UDP listener.
+
+  --max-datagram limits each UDP payload between proxies in both directions.
+  Each proxy controls its outgoing limit; the two limits need not match.
+  At the default 1200, ordinary IPv4 packets use at most 1228 bytes and IPv6
+  packets at most 1248 bytes. Allow extra space for other encapsulation.
+  Lower this limit if the external path requires smaller packets.
+  This mode does not discover path MTU or change the WireGuard interface MTU.
+
+  Reordering and duplicates are supported. Incomplete messages expire after
+  5 seconds, with at most 64 pending messages per receiver. Lost fragments
+  are not retransmitted: the incomplete WireGuard message is dropped.
+
+EXAMPLES:
+  Client (WireGuard endpoint = 127.0.0.1:3000):
+    rs-wgobfs -l 127.0.0.1:3000 -f SERVER:1415 -k SHARED_KEY -m obfs-frag
+
+  Server (WireGuard listens on 127.0.0.1:51820):
+    rs-wgobfs -l 0.0.0.0:1415 -f 127.0.0.1:51820 -k SHARED_KEY -m unobfs-frag
+
+  For a smaller path MTU, append --max-datagram 1100 on each sending proxy.
 
 ";
 
