@@ -1,0 +1,78 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustup target add '${{ matrix.target }}'
+      - name: Validate version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$GITHUB_REF_NAME" = "v$version"
+      - run: cargo test --locked --all-features --target ${{ matrix.target }}
+      - run: cargo clippy --locked --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name="rs-wgobfs-${GITHUB_REF_NAME//\//-}-${{ matrix.target }}"
+          mkdir -p "stage/$name" dist
+          cp README.md docs/fragment-transport.md "stage/$name/"
+          if [[ '${{ runner.os }}' == Windows ]]; then
+            cp 'target/${{ matrix.target }}/release/rs-wgobfs.exe' "stage/$name/"
+            7z a -tzip "dist/$name.zip" "./stage/$name/*"
+          else
+            cp 'target/${{ matrix.target }}/release/rs-wgobfs' "stage/$name/"
+            tar -czf "dist/$name.tar.gz" -C stage "$name"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "rs-wgobfs $GITHUB_REF_NAME" --notes-file docs/release-v0.6.2.md
