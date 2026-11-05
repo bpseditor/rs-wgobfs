@@ -92,5 +92,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release download "$RELEASE_TAG" --pattern '*.tar.gz' --pattern '*.zip' --dir dist --skip-existing
+          fi
           (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS)
-          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "rs-wgobfs $RELEASE_TAG" --notes-file docs/release-v0.6.2.md
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            gh release edit "$RELEASE_TAG" --notes-file docs/release-v0.6.2.md
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --title "rs-wgobfs $RELEASE_TAG" --notes-file docs/release-v0.6.2.md
+          fi
