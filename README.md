@@ -34,7 +34,8 @@ OPTIONS:
   -k or --key                         Shared secret (will be repeated or
                                       truncated to 32 characters)
 
-  -m or --mode <obfs|unobfs>          Mode, either obfs or unobfs
+  -m or --mode <mode>                 Mode: obfs, unobfs, obfs-frag, unobfs-frag
+  --max-datagram <bytes>              Fragment mode UDP payload limit (default 1200)
 ```
 
 To obfuscate WG to a remote peer, first update the WG configuration, replace the
@@ -50,6 +51,49 @@ To accept obfucated WG traffic from clients on a WG server:
 ```
 rs-wgobfs -l listen_ip:listen_port -f wg_server:port -k mysecretkey -m unobfs
 ```
+
+## Fragment transport between two rs-wgobfs peers
+
+Use `obfs-frag` on the client and `unobfs-frag` on the server to split large
+WireGuard messages into bounded UDP datagrams. Both peers must support this
+mode; it is not compatible with `xt_wgobfs` or the legacy `obfs`/`unobfs` modes.
+The existing modes and their wire format remain available unchanged.
+
+Client (point the local WireGuard endpoint at `127.0.0.1:3000`):
+
+```sh
+rs-wgobfs -l 127.0.0.1:3000 -f SERVER:1415 -k SHARED_KEY -m obfs-frag
+```
+
+Server (with WireGuard listening at `127.0.0.1:51820`):
+
+```sh
+rs-wgobfs -l 0.0.0.0:1415 -f 127.0.0.1:51820 -k SHARED_KEY -m unobfs-frag
+```
+
+The default maximum **UDP payload** between proxies is 1200 bytes, including
+framing and obfuscation padding. Add 28 bytes for ordinary IPv4/UDP or 48 bytes
+for IPv6/UDP to obtain the IP packet size (additional IP headers or encapsulation
+need additional space). Override with `--max-datagram 1100`, for example, when
+the external path requires smaller packets. Valid values are 128..=65507; the
+option is only accepted with fragment modes. Each peer controls its outgoing
+limit independently; their configured limits need not match.
+
+Each fragment is obfuscated separately, including its framing metadata. The
+receiver reassembles the exact original WireGuard message before delivering it
+to WireGuard. Reordering and duplicate fragments are supported. Incomplete
+messages expire after five seconds; each receiver holds at most 64 incomplete
+messages (about 4 MiB of payload), shared across senders on the listening side.
+When full, new incomplete messages are dropped. There are no acknowledgments
+or retransmissions: losing a fragment loses the original message, as with UDP.
+WireGuard keepalives are forwarded in this mode without random suppression.
+
+This avoids requiring the original WireGuard message to fit the external path
+MTU, provided each outgoing fragment fits. It does not discover the path MTU
+automatically or change the WireGuard interface MTU. Local UDP/IP size limits
+still apply. Obfuscation is not authentication: WireGuard authenticates the
+reassembled message; the framing itself has no separate authentication layer.
+See [fragment wire format](docs/fragment-transport.md) for protocol details.
 
 ## Performance and validation
 

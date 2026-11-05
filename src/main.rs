@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 #[cfg(test)]
 mod chacha;
 mod chacha_glue;
+mod fragment;
 #[cfg(test)]
 mod guts;
 mod wgobfs;
@@ -30,13 +31,17 @@ OPTIONS:
   -k or --key                         Shared secret (will be repeated or
                                       truncated to 32 characters)
 
-  -m or --mode <obfs|unobfs>          Mode, either obfs or unobfs
+  -m or --mode <mode>                 Mode: obfs, unobfs, obfs-frag, unobfs-frag
+  --max-datagram <bytes>              Fragment mode UDP payload limit (default 1200)
+
 ";
 
 #[derive(Copy, Clone)]
 enum OPMode {
     Obfs,
     UnObfs,
+    ObfsFrag(usize),
+    UnObfsFrag(usize),
 }
 
 struct AppArgs {
@@ -137,23 +142,45 @@ fn parse_args() -> Result<AppArgs, pico_args::Error> {
     let key_arr = expand_key(&key)?;
 
     let prefer_v6: bool = pargs.contains("-6");
+    let limit: Option<usize> = pargs.opt_value_from_str("--max-datagram")?;
+    let obfs_mode = parse_mode(&mode, limit)
+        .map_err(|cause| pico_args::Error::ArgumentParsingFailed { cause })?;
+    if !pargs.finish().is_empty() {
+        return Err(pico_args::Error::ArgumentParsingFailed {
+            cause: "unknown arguments".into(),
+        });
+    }
     let args = AppArgs {
         local_addr: parse_socket_addr(&local_str, false)
             .expect("Failed to parse listening address"),
         fwd_addr: parse_socket_addr(&remote_str, prefer_v6)
             .expect("Failed to parse the remote address"),
         key: key_arr,
-        obfs_mode: match mode.as_str() {
-            "obfs" => OPMode::Obfs,
-            "unobfs" => OPMode::UnObfs,
-            _ => {
-                eprintln!("Invalide --mode: {}", mode);
-                std::process::exit(1);
-            }
-        },
+        obfs_mode,
     };
 
     Ok(args)
+}
+
+fn parse_mode(mode: &str, limit: Option<usize>) -> Result<OPMode, String> {
+    if limit.is_some() && !matches!(mode, "obfs-frag" | "unobfs-frag") {
+        return Err("--max-datagram requires obfs-frag or unobfs-frag".into());
+    }
+    let limit = limit.unwrap_or(fragment::DEFAULT_LIMIT);
+    if !(fragment::MIN_LIMIT..=fragment::MAX_LIMIT).contains(&limit) {
+        return Err(format!(
+            "--max-datagram must be {}..={}",
+            fragment::MIN_LIMIT,
+            fragment::MAX_LIMIT
+        ));
+    }
+    match mode {
+        "obfs" => Ok(OPMode::Obfs),
+        "unobfs" => Ok(OPMode::UnObfs),
+        "obfs-frag" => Ok(OPMode::ObfsFrag(limit)),
+        "unobfs-frag" => Ok(OPMode::UnObfsFrag(limit)),
+        _ => Err(format!("invalid --mode: {mode}")),
+    }
 }
 
 // Large enough for a non-jumbogram UDP payload, plus obfuscation padding.
@@ -185,10 +212,23 @@ impl SendErrors {
 }
 
 impl OPMode {
+    fn fragment_limit(self) -> Option<usize> {
+        match self {
+            Self::ObfsFrag(limit) | Self::UnObfsFrag(limit) => Some(limit),
+            _ => None,
+        }
+    }
+
+    fn is_obfs(self) -> bool {
+        matches!(self, Self::Obfs | Self::ObfsFrag(_))
+    }
+
     fn reverse(self) -> Self {
         match self {
             Self::Obfs => Self::UnObfs,
             Self::UnObfs => Self::Obfs,
+            Self::ObfsFrag(limit) => Self::UnObfsFrag(limit),
+            Self::UnObfsFrag(limit) => Self::ObfsFrag(limit),
         }
     }
 
@@ -196,15 +236,15 @@ impl OPMode {
     fn transform(self, buf: &mut [u8], len: usize, key: &[u8; 32]) -> Option<usize> {
         let mut padding = 0;
         let state = match self {
-            Self::Obfs => obfs_udp_payload(buf, len, key, &mut padding),
-            Self::UnObfs => unobfs_udp_payload(buf, len, key, &mut padding),
+            Self::Obfs | Self::ObfsFrag(_) => obfs_udp_payload(buf, len, key, &mut padding),
+            Self::UnObfs | Self::UnObfsFrag(_) => unobfs_udp_payload(buf, len, key, &mut padding),
         };
         match state {
             ForwardState::NFDrop => None,
             ForwardState::XTContinue => {
                 let len = match self {
-                    Self::Obfs => len + padding,
-                    Self::UnObfs => len - padding,
+                    Self::Obfs | Self::ObfsFrag(_) => len + padding,
+                    Self::UnObfs | Self::UnObfsFrag(_) => len - padding,
                 };
                 (len <= MAX_UDP_PAYLOAD).then_some(len)
             }
@@ -235,8 +275,17 @@ async fn return_packets(
     // buffer on the heap so it does not inflate the task's future/stack.
     let mut buf = vec![0u8; PACKET_BUFFER_SIZE];
     let mut send_errors = SendErrors::default();
+    let mut codec = fragment::Codec::default();
+    let mut fragment_cleanup = tokio::time::interval(Duration::from_secs(1));
     loop {
-        let mut len = match socket.recv(&mut buf[..MAX_UDP_PAYLOAD]).await {
+        let received = tokio::select! {
+            result = socket.recv(&mut buf[..MAX_UDP_PAYLOAD]) => result,
+            _ = fragment_cleanup.tick(), if mode.fragment_limit().is_some() => {
+                codec.expire(Instant::now());
+                continue;
+            }
+        };
+        let mut len = match received {
             Ok(len) => len,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
@@ -245,14 +294,22 @@ async fn return_packets(
             }
         };
         for batch_index in 0..RECEIVE_BATCH {
-            if let Some(out_len) = mode.transform(&mut buf, len, &key) {
-                let result = match listener.try_send_to(&buf[..out_len], client_addr) {
+            let packets = codec.packets(mode, &mut buf, len, &key, client_addr);
+            for (fragment_index, packet) in packets.iter().enumerate() {
+                let result = match listener.try_send_to(packet, client_addr) {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        listener.send_to(&buf[..out_len], client_addr).await
+                        listener.send_to(packet, client_addr).await
                     }
                     result => result,
                 };
-                send_errors.report(result, client_addr, out_len);
+                let failed = result.is_err();
+                send_errors.report(result, client_addr, packet.len());
+                if failed {
+                    break;
+                }
+                if (fragment_index + 1) % RECEIVE_BATCH == 0 {
+                    tokio::task::yield_now().await;
+                }
             }
             if batch_index + 1 == RECEIVE_BATCH {
                 tokio::task::yield_now().await;
@@ -316,6 +373,8 @@ async fn run_with_timeouts(
     let mut clients: HashMap<SocketAddr, Client> = HashMap::new();
     let mut buf = vec![0u8; PACKET_BUFFER_SIZE];
     let mut send_errors = SendErrors::default();
+    let mut codec = fragment::Codec::default();
+    let mut fragment_cleanup = tokio::time::interval(Duration::from_secs(1));
     let mut cleanup = tokio::time::interval(cleanup_interval);
     cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let bind_addr = if args.fwd_addr.is_ipv4() {
@@ -329,8 +388,13 @@ async fn run_with_timeouts(
     loop {
         let (mut len, mut client_addr) = tokio::select! {
             result = listener.recv_from(&mut buf[..MAX_UDP_PAYLOAD]) => result?,
+            _ = fragment_cleanup.tick(), if args.obfs_mode.fragment_limit().is_some() => {
+                codec.expire(Instant::now());
+                continue;
+            }
             _ = cleanup.tick() => {
                 let now = Instant::now();
+                codec.expire(now);
                 clients.retain(|_, client| {
                     !client.handle.is_finished() && now.duration_since(client.last_seen) < client_timeout
                 });
@@ -344,7 +408,8 @@ async fn run_with_timeouts(
             if let Some(client) = clients.get_mut(&client_addr) {
                 client.last_seen = Instant::now();
             }
-            if let Some(out_len) = args.obfs_mode.transform(&mut buf, len, &args.key) {
+            let packets = codec.packets(args.obfs_mode, &mut buf, len, &args.key, client_addr);
+            for (fragment_index, packet) in packets.iter().enumerate() {
                 let client = match clients.entry(client_addr) {
                     std::collections::hash_map::Entry::Occupied(mut entry) => {
                         if entry.get().handle.is_finished() {
@@ -358,12 +423,12 @@ async fn run_with_timeouts(
                         entry.insert(new_client(bind_addr, &args, &listener, client_addr).await?)
                     }
                 };
-                let result = match client.socket.try_send(&buf[..out_len]) {
+                let result = match client.socket.try_send(packet) {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         // A new socket may not have registered write readiness
                         // yet. Allow it to become ready, but bound congestion's
                         // effect on other clients and cleanup in this loop.
-                        tokio::time::timeout(SEND_TIMEOUT, client.socket.send(&buf[..out_len]))
+                        tokio::time::timeout(SEND_TIMEOUT, client.socket.send(packet))
                             .await
                             .unwrap_or_else(|_| {
                                 Err(std::io::Error::new(
@@ -374,7 +439,14 @@ async fn run_with_timeouts(
                     }
                     result => result,
                 };
-                send_errors.report(result, args.fwd_addr, out_len);
+                let failed = result.is_err();
+                send_errors.report(result, args.fwd_addr, packet.len());
+                if failed {
+                    break;
+                }
+                if (fragment_index + 1) % RECEIVE_BATCH == 0 {
+                    tokio::task::yield_now().await;
+                }
             }
             if batch_index + 1 == RECEIVE_BATCH {
                 // Bound bursts so busy senders cannot starve response tasks/timers.
@@ -414,6 +486,24 @@ async fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragment_cli_validation() {
+        assert!(matches!(
+            parse_mode("obfs-frag", None).unwrap(),
+            OPMode::ObfsFrag(1200)
+        ));
+        assert!(matches!(
+            parse_mode("unobfs-frag", Some(128)).unwrap(),
+            OPMode::UnObfsFrag(128)
+        ));
+        for limit in [0, 127, 65_508, usize::MAX] {
+            assert!(parse_mode("obfs-frag", Some(limit)).is_err());
+        }
+        assert!(parse_mode("obfs", Some(1200)).is_err());
+        assert!(parse_mode("unobfs", Some(1200)).is_err());
+        assert!(parse_mode("unknown", None).is_err());
+    }
 
     #[test]
     fn key_expansion_preserves_byte_semantics() {
@@ -501,7 +591,7 @@ mod tests {
             .await;
     }
 
-    async fn check_udp_route(ip: &str, forward_ip: &str) {
+    async fn check_udp_route(ip: &str, forward_ip: &str, limit: Option<usize>) {
         let bind = format!("{ip}:0").parse().unwrap();
         let echo =
             Rc::new(create_dual_stack_socket(format!("{forward_ip}:0").parse().unwrap()).unwrap());
@@ -521,7 +611,7 @@ mod tests {
                 local_addr: unobfs_addr,
                 fwd_addr: echo_addr,
                 key,
-                obfs_mode: OPMode::UnObfs,
+                obfs_mode: limit.map_or(OPMode::UnObfs, |n| OPMode::UnObfsFrag(n + 64)),
             },
             unobfs_listener,
         ));
@@ -532,7 +622,7 @@ mod tests {
                 local_addr: obfs_addr,
                 fwd_addr: unobfs_addr,
                 key,
-                obfs_mode: OPMode::Obfs,
+                obfs_mode: limit.map_or(OPMode::Obfs, OPMode::ObfsFrag),
             },
             obfs_listener,
         ));
@@ -599,15 +689,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fragments_cross_udp_relay_with_payload_cap() {
+        tokio::task::LocalSet::new().run_until(async {
+            use std::cell::Cell;
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let key = [71;32];
+            let limit = 576;
+            let echo = create_dual_stack_socket(bind).unwrap();
+            let echo_addr = echo.local_addr().unwrap();
+            let echo_task = tokio::task::spawn_local(async move {
+                let mut buf = vec![0; MAX_UDP_PAYLOAD];
+                loop {
+                    let (n,peer) = echo.recv_from(&mut buf).await.unwrap();
+                    echo.send_to(&buf[..n],peer).await.unwrap();
+                }
+            });
+            let server = Rc::new(create_dual_stack_socket(bind).unwrap());
+            let server_addr = server.local_addr().unwrap();
+            let server_task = tokio::task::spawn_local(run(AppArgs {
+                local_addr: server_addr, fwd_addr: echo_addr, key,
+                obfs_mode: OPMode::UnObfsFrag(limit),
+            },server));
+            // Emulate a path that drops every UDP payload larger than the cap.
+            // Inspect both directions on real sockets, outside the codecs.
+            let relay_in = create_dual_stack_socket(bind).unwrap();
+            let relay_addr = relay_in.local_addr().unwrap();
+            let relay_out = create_dual_stack_socket(bind).unwrap();
+            relay_out.connect(server_addr).await.unwrap();
+            let counts = Rc::new([Cell::new(0usize),Cell::new(0usize)]);
+            let observed = Rc::clone(&counts);
+            let relay_task = tokio::task::spawn_local(async move {
+                let mut outbound = vec![0;MAX_UDP_PAYLOAD];
+                let mut inbound = vec![0;MAX_UDP_PAYLOAD];
+                let mut client_addr = None;
+                loop {
+                    tokio::select! {
+                        received = relay_in.recv_from(&mut outbound) => {
+                            let (n,peer) = received.unwrap();
+                            client_addr = Some(peer);
+                            assert!(n <= limit, "oversized client fragment: {n}");
+                            if n <= limit {
+                                observed[0].set(observed[0].get()+1);
+                                relay_out.send(&outbound[..n]).await.unwrap();
+                            }
+                        }
+                        received = relay_out.recv(&mut inbound) => {
+                            let n = received.unwrap();
+                            assert!(n <= limit, "oversized server fragment: {n}");
+                            if n <= limit {
+                                observed[1].set(observed[1].get()+1);
+                                relay_in.send_to(&inbound[..n],client_addr.unwrap()).await.unwrap();
+                            }
+                        }
+                    }
+                }
+            });
+            let proxy = Rc::new(create_dual_stack_socket(bind).unwrap());
+            let proxy_addr = proxy.local_addr().unwrap();
+            let proxy_task = tokio::task::spawn_local(run(AppArgs {
+                local_addr: proxy_addr, fwd_addr: relay_addr, key,
+                obfs_mode: OPMode::ObfsFrag(limit),
+            },proxy));
+            let client = create_dual_stack_socket(bind).unwrap();
+            client.connect(proxy_addr).await.unwrap();
+            for size in [32,148,1500,9000,65_000] {
+                let mut packet: Vec<u8> = (0..size).map(|i| i as u8).collect();
+                packet[..4].copy_from_slice(&[4,0,0,0]);
+                client.send(&packet).await.unwrap();
+                let mut response = vec![0;MAX_UDP_PAYLOAD];
+                let n = tokio::time::timeout(Duration::from_secs(3),client.recv(&mut response))
+                    .await.unwrap().unwrap();
+                assert_eq!(&response[..n],packet, "size={size}");
+            }
+            assert!(counts[0].get() > 100);
+            assert!(counts[1].get() > 100);
+            assert!(!relay_task.is_finished());
+            proxy_task.abort();
+            server_task.abort();
+            relay_task.abort();
+            echo_task.abort();
+        }).await;
+    }
+
+    #[tokio::test]
     async fn udp_routes_ipv4_ipv6_and_multiple_clients() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                check_udp_route("127.0.0.1", "127.0.0.1").await;
+                check_udp_route("127.0.0.1", "127.0.0.1", None).await;
+                check_udp_route("127.0.0.1", "127.0.0.1", Some(1200)).await;
                 // IPv6 may be disabled on an otherwise supported host.
                 if std::net::UdpSocket::bind("[::1]:0").is_ok() {
-                    check_udp_route("[::1]", "[::1]").await;
-                    check_udp_route("127.0.0.1", "[::1]").await;
-                    check_udp_route("[::1]", "127.0.0.1").await;
+                    check_udp_route("[::1]", "[::1]", None).await;
+                    check_udp_route("[::1]", "[::1]", Some(1200)).await;
+                    check_udp_route("127.0.0.1", "[::1]", None).await;
+                    check_udp_route("127.0.0.1", "[::1]", Some(1200)).await;
+                    check_udp_route("[::1]", "127.0.0.1", None).await;
+                    check_udp_route("[::1]", "127.0.0.1", Some(1200)).await;
                 }
             })
             .await;
