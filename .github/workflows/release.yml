@@ -1,0 +1,104 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and publish
+        required: true
+        default: v0.6.2
+permissions:
+  contents: read
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-22.04
+            target: armv7-unknown-linux-gnueabihf
+            cross: true
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    env:
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustup target add '${{ matrix.target }}'
+      - name: Install ARMv7 linker
+        if: matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
+      - name: Validate version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$RELEASE_TAG" = "v$version"
+      - run: cargo test --locked --all-features --target ${{ matrix.target }}
+        if: ${{ !matrix.cross }}
+      - run: cargo test --locked --all-features --target ${{ matrix.target }} --no-run
+        if: matrix.cross
+      - run: cargo clippy --locked --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name="rs-wgobfs-${RELEASE_TAG//\//-}-${{ matrix.target }}"
+          mkdir -p "stage/$name" dist
+          cp README.md docs/fragment-transport.md "stage/$name/"
+          if [[ '${{ runner.os }}' == Windows ]]; then
+            cp 'target/${{ matrix.target }}/release/rs-wgobfs.exe' "stage/$name/"
+            7z a -tzip "dist/$name.zip" "./stage/$name/*"
+          else
+            cp 'target/${{ matrix.target }}/release/rs-wgobfs' "stage/$name/"
+            tar -czf "dist/$name.tar.gz" -C stage "$name"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release download "$RELEASE_TAG" --pattern '*.tar.gz' --pattern '*.zip' --dir dist --skip-existing
+          fi
+          (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS)
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            gh release edit "$RELEASE_TAG" --notes-file docs/release-v0.6.2.md
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --title "rs-wgobfs $RELEASE_TAG" --notes-file docs/release-v0.6.2.md
+          fi
